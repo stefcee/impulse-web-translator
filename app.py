@@ -11,12 +11,274 @@ import io
 import time
 import uuid
 import threading
+import requests
+import psycopg
+from psycopg.rows import dict_row
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, send_file, jsonify, Response
 from deep_translator import GoogleTranslator
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "impulse_web_key_2026")
+
+# ==================== DISCORD WEBHOOK ====================
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK", "")
+
+def send_milestone_webhook(count):
+    """Sendet Discord Notification bei Milestones"""
+    milestones = [10, 25, 50, 100, 250, 500, 750, 1000, 2500, 5000]
+    
+    if count not in milestones or not DISCORD_WEBHOOK_URL:
+        return
+    
+    embed = {
+        "embeds": [{
+            "title": "🚀 Impulse Translator - Milestone Reached!",
+            "description": f"**{count} translations completed!** 🎉",
+            "color": 15844367,  # Gold color
+            "fields": [
+                {
+                    "name": "📊 Total Translations",
+                    "value": f"**{count}**",
+                    "inline": True
+                },
+                {
+                    "name": "⏰ Time",
+                    "value": datetime.now().strftime("%d.%m.%Y %H:%M CET"),
+                    "inline": True
+                }
+            ],
+            "footer": {
+                "text": "Impulse Translator • Created by Stefc3"
+            },
+            "timestamp": datetime.utcnow().isoformat()
+        }]
+    }
+    
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json=embed, timeout=5)
+        if response.status_code == 204:
+            print(f"✅ Milestone webhook sent: {count}")
+        else:
+            print(f"⚠ Webhook response: {response.status_code}")
+    except Exception as e:
+        print(f"⚠ Webhook failed: {e}")
+# ==================== END WEBHOOK ====================
+
+# ==================== DATABASE ====================
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+def get_db_connection():
+    """Verbindung zur PostgreSQL DB"""
+    try:
+        conn = psycopg.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        print(f"❌ DB Connection Error: {e}")
+        return None
+
+def init_db():
+    """Erstellt Tabellen wenn nicht vorhanden"""
+    conn = get_db_connection()
+    if not conn:
+        print("⚠ No database connection - skipping init")
+        return
+    
+    try:
+        with conn.cursor() as cur:
+            # Counter Tabelle
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS impulse_translation_count (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    count INTEGER DEFAULT 0,
+                    last_updated TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            cur.execute("""
+                INSERT INTO impulse_translation_count (id, count) 
+                VALUES (1, 0) 
+                ON CONFLICT (id) DO NOTHING
+            """)
+            
+            # Translated Files Tabelle
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS impulse_translated_files (
+                    file_id VARCHAR(255) PRIMARY KEY,
+                    data JSONB NOT NULL,
+                    lang_code VARCHAR(50) NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    downloaded BOOLEAN DEFAULT FALSE,
+                    downloaded_at TIMESTAMP
+                )
+            """)
+            
+            conn.commit()
+            print("✅ Database initialized successfully")
+    except Exception as e:
+        print(f"❌ DB Init Error: {e}")
+    finally:
+        conn.close()
+
+def load_counter():
+    """Lädt Counter aus DB"""
+    conn = get_db_connection()
+    if not conn:
+        print("⚠ No DB connection - using RAM counter (0)")
+        return 0
+    
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT count FROM impulse_translation_count WHERE id = 1")
+            result = cur.fetchone()
+            count = result['count'] if result else 0
+            print(f"✅ Counter loaded from DB: {count}")
+            return count
+    except Exception as e:
+        print(f"❌ Counter Load Error: {e}")
+        return 0
+    finally:
+        conn.close()
+
+def save_counter(count):
+    """Speichert Counter in DB"""
+    conn = get_db_connection()
+    if not conn:
+        print("⚠ No DB connection - counter not saved")
+        return
+    
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE impulse_translation_count 
+                SET count = %s, last_updated = NOW() 
+                WHERE id = 1
+            """, (count,))
+            conn.commit()
+            print(f"✅ Counter saved to DB: {count}")
+    except Exception as e:
+        print(f"❌ Counter Save Error: {e}")
+    finally:
+        conn.close()
+
+def save_translated_file(file_id, data, lang_code):
+    """Speichert übersetzte Datei in DB"""
+    conn = get_db_connection()
+    if not conn:
+        print("⚠ No DB connection - file not saved")
+        return
+    
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO impulse_translated_files (file_id, data, lang_code)
+                VALUES (%s, %s, %s)
+            """, (file_id, json.dumps(data), lang_code))
+            conn.commit()
+            print(f"💾 File saved to DB: {file_id}")
+    except Exception as e:
+        print(f"❌ File Save Error: {e}")
+    finally:
+        conn.close()
+
+def get_translated_file(file_id):
+    """Lädt übersetzte Datei aus DB"""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT data, lang_code, downloaded 
+                FROM impulse_translated_files 
+                WHERE file_id = %s
+            """, (file_id,))
+            result = cur.fetchone()
+            
+            if result:
+                print(f"✅ File loaded from DB: {file_id}")
+                return {
+                    'data': result['data'],
+                    'lang_code': result['lang_code'],
+                    'downloaded': result['downloaded']
+                }
+            return None
+    except Exception as e:
+        print(f"❌ File Load Error: {e}")
+        return None
+    finally:
+        conn.close()
+
+def mark_file_downloaded(file_id):
+    """Markiert Datei als downloaded"""
+    conn = get_db_connection()
+    if not conn:
+        return
+    
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE impulse_translated_files 
+                SET downloaded = TRUE, downloaded_at = NOW()
+                WHERE file_id = %s
+            """, (file_id,))
+            conn.commit()
+            print(f"✅ File marked as downloaded: {file_id}")
+    except Exception as e:
+        print(f"❌ Mark Downloaded Error: {e}")
+    finally:
+        conn.close()
+
+def cleanup_old_files():
+    """
+    Background-Task: Löscht Dateien die:
+    1. Downloaded wurden
+    2. Älter als 1 Stunde sind
+    """
+    while True:
+        try:
+            conn = get_db_connection()
+            if not conn:
+                print("⚠ No DB connection for cleanup")
+                time.sleep(600)
+                continue
+            
+            with conn.cursor() as cur:
+                # Lösche downloaded Files
+                cur.execute("""
+                    DELETE FROM impulse_translated_files 
+                    WHERE downloaded = TRUE
+                """)
+                deleted_downloaded = cur.rowcount
+                
+                # Lösche alte Files (älter als 1 Stunde)
+                cur.execute("""
+                    DELETE FROM impulse_translated_files 
+                    WHERE created_at < NOW() - INTERVAL '1 hour'
+                """)
+                deleted_old = cur.rowcount
+                
+                conn.commit()
+                
+                if deleted_downloaded > 0 or deleted_old > 0:
+                    print(f"🗑 Cleanup: {deleted_downloaded} downloaded, {deleted_old} old files deleted")
+            
+            conn.close()
+        
+        except Exception as e:
+            print(f"⚠ Cleanup-Fehler: {e}")
+        
+        time.sleep(600)  # Alle 10 Minuten
+
+# Database initialisieren beim Start
+init_db()
+translation_count = load_counter()
+
+# Cleanup-Task starten
+cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
+cleanup_thread.start()
+# ==================== END DATABASE ====================
 
 # Vollständige 56-Sprachen-Liste
 LANGUAGES = {
@@ -34,38 +296,6 @@ LANGUAGES = {
     "Tamil": "ta", "Telugu": "te", "Thai": "th", "Turkish": "tr", "Ukrainian": "uk",
     "Urdu": "ur", "Vietnamese": "vi", "Welsh": "cy", "Yiddish": "yi"
 }
-
-# Temporärer Speicher für übersetzte Dateien mit Timestamp
-translated_files = {}
-
-def cleanup_old_files():
-    """Background-Task: Löscht Dateien älter als 1 Stunde"""
-    while True:
-        try:
-            now = datetime.now()
-            to_delete = []
-            
-            for file_id, file_data in translated_files.items():
-                if 'timestamp' in file_data:
-                    age = now - file_data['timestamp']
-                    if age > timedelta(hours=1):
-                        to_delete.append(file_id)
-            
-            for file_id in to_delete:
-                del translated_files[file_id]
-                print(f"🗑 Gelöscht: {file_id} (älter als 1 Stunde)")
-            
-            if to_delete:
-                print(f"✅ Cleanup: {len(to_delete)} Dateien gelöscht")
-        
-        except Exception as e:
-            print(f"⚠ Cleanup-Fehler: {e}")
-        
-        time.sleep(600)  # Alle 10 Minuten
-
-# Cleanup-Task im Hintergrund starten
-cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
-cleanup_thread.start()
 
 def flatten_dict(d, parent_key='', sep='|||'):
     """Flatten nested dictionary into flat structure for translation"""
@@ -199,11 +429,23 @@ def translate_with_sse(data, target_lang, target_lang_name):
             # Eindeutige ID für Download
             file_id = str(uuid.uuid4())
             lang_code_upper = target_lang.upper().replace('-', '_')
-            translated_files[file_id] = {
-                'data': final_output,
-                'lang_code': lang_code_upper,
-                'timestamp': datetime.now()
-            }
+            
+            # Speichere in PostgreSQL statt RAM!
+            save_translated_file(file_id, final_output, lang_code_upper)
+            
+            print(f"✅ Translation complete - file_id: {file_id}")
+            
+            # ==================== COUNTER & WEBHOOK ====================
+            global translation_count
+            translation_count += 1
+            save_counter(translation_count)
+            
+            threading.Thread(
+                target=send_milestone_webhook, 
+                args=(translation_count,), 
+                daemon=True
+            ).start()
+            # ==================== END ====================
             
             yield log_message('info', '=' * 60)
             yield log_message('success', '✅ ÜBERSETZUNG ABGESCHLOSSEN!')
@@ -268,22 +510,29 @@ def translate():
 
 @app.route('/download/<file_id>')
 def download(file_id):
-    """Download der übersetzten Datei"""
-    if file_id not in translated_files:
+    """Download der übersetzten Datei aus PostgreSQL"""
+    print(f"📥 Download request for file_id: {file_id}")
+    
+    # Lade aus PostgreSQL
+    file_info = get_translated_file(file_id)
+    
+    if not file_info:
+        print(f"❌ Download failed - file_id not found: {file_id}")
         return jsonify({'error': 'Datei nicht gefunden oder abgelaufen'}), 404
     
     try:
-        file_info = translated_files[file_id]
         data = file_info['data']
         lang_code = file_info['lang_code']
+        
+        print(f"✅ Download started - file_id: {file_id}, lang: {lang_code}")
         
         # JSON erstellen
         output = io.BytesIO()
         output.write(json.dumps(data, indent=4, ensure_ascii=False).encode('utf-8'))
         output.seek(0)
         
-        # Nach Download aus Speicher löschen
-        del translated_files[file_id]
+        # Markiere als downloaded (wird beim nächsten Cleanup gelöscht)
+        mark_file_downloaded(file_id)
         
         return send_file(
             output,
@@ -292,17 +541,32 @@ def download(file_id):
             mimetype='application/json'
         )
     except Exception as e:
+        print(f"❌ Download error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health-Check für Render.com"""
+    conn = get_db_connection()
+    cached_files = 0
+    
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM impulse_translated_files")
+                cached_files = cur.fetchone()[0]
+            conn.close()
+        except:
+            pass
+    
     return jsonify({
         'status': 'ok', 
         'languages': len(LANGUAGES),
-        'cached_files': len(translated_files)
+        'cached_files': cached_files,
+        'total_translations': translation_count
     }), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    print(f"🚀 Impulse Translator starting... (Total translations: {translation_count})")
     app.run(host='0.0.0.0', port=port, debug=False)
